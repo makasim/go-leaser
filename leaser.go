@@ -66,14 +66,14 @@ func New(d driver) (*Leaser, error) {
 }
 
 func (lsr *Leaser) Acquire(resource string) (Lease, error) {
+	if resource == `` {
+		return Lease{}, fmt.Errorf(`resource must be provided`)
+	}
+
 	select {
 	case <-lsr.closeCh:
 		return Lease{}, fmt.Errorf(`leaser is closed`)
 	default:
-	}
-
-	if resource == `` {
-		return Lease{}, fmt.Errorf(`resource must be provided`)
 	}
 
 	ls := lsr.getOrCreate(resource)
@@ -107,6 +107,12 @@ func (lsr *Leaser) Release(ls0 Lease) error {
 	}
 	if ls0.Owner == `` {
 		return fmt.Errorf(`lease must be acquired; owner empty`)
+	}
+
+	select {
+	case <-lsr.closeCh:
+		return fmt.Errorf(`leaser is closed`)
+	default:
 	}
 
 	ls := lsr.getOrCreate(ls0.Resource)
