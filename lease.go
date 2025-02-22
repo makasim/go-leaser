@@ -24,6 +24,8 @@ type lease struct {
 
 	cancel context.CancelFunc
 	cond   *sync.Cond
+
+	prolongAttempts int
 }
 
 func (l *lease) lock() {
@@ -36,4 +38,13 @@ func (l *lease) unlock() {
 
 func (l *lease) wait() {
 	l.cond.Wait()
+}
+
+func (l *lease) free() {
+	l.Owner = ``
+	l.Rev = 0
+	l.ExpireAt = time.Time{}
+	l.prolongAttempts = 0
+
+	l.cond.Signal()
 }

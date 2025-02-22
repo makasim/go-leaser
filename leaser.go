@@ -13,7 +13,7 @@ import (
 )
 
 type driver interface {
-	Tail(sinceRev, limit int64) ([]*Lease, error)
+	Tail(sinceRev, limit int64) ([]Lease, error)
 	Upsert(owner, resource string, dur time.Duration) error
 	Delete(owner, resource string) error
 }
@@ -92,10 +92,12 @@ func (lsr *Leaser) Acquire(resource string) (Lease, error) {
 			ls.Owner = `tbd`
 			continue
 		} else if err != nil {
-			return Lease{}, err
+			return Lease{}, fmt.Errorf("%T: upsert: %w", lsr.d, err)
 		}
 
 		ls.Owner = lsr.owner
+		ls.Rev = 0
+		ls.prolongAttempts = 0
 		ls.ExpireAt = time.Now().Add(lsr.dur)
 		return ls.Lease, nil
 	}
@@ -127,20 +129,14 @@ func (lsr *Leaser) Release(ls0 Lease) error {
 	}
 
 	if err := lsr.d.Delete(ls.Owner, ls.Resource); errors.Is(err, ErrNotAcquired) {
-		ls.Owner = ``
-		ls.Rev = 0
-		ls.ExpireAt = time.Time{}
-		ls.cond.Signal()
+		ls.free()
 
 		return err
 	} else if err != nil {
 		return fmt.Errorf("%T: %w", lsr.d, err)
 	}
 
-	ls.Owner = ``
-	ls.Rev = 0
-	ls.ExpireAt = time.Time{}
-	ls.cond.Signal()
+	ls.free()
 
 	return nil
 }
@@ -177,20 +173,37 @@ func (lsr *Leaser) getOrCreate(resource string) *lease {
 }
 
 func (lsr *Leaser) loopProlong() {
+	t := time.NewTicker(time.Second * 5)
+	defer t.Stop()
 
+	for {
+		select {
+		case <-t.C:
+			lsr.prolong()
+		case <-lsr.closeCh:
+			return
+		}
+	}
+}
+
+func (lsr *Leaser) prolong() {
 	lsr.leasesMux.RLock()
 
-	prolong := make([]Lease, 0, len(lsr.leases))
+	prolong := make([]string, 0, len(lsr.leases))
 	left := time.Now().Add(-time.Second * 20)
 	for _, ls := range lsr.leases {
+		ls.lock()
 		if ls.Owner == `` {
+			ls.unlock()
 			continue
 		}
 		if ls.ExpireAt.Before(left) {
+			ls.unlock()
 			continue
 		}
 
-		prolong = append(prolong, ls.Lease)
+		prolong = append(prolong, ls.Resource)
+		ls.unlock()
 	}
 	lsr.leasesMux.RUnlock()
 
@@ -198,22 +211,42 @@ func (lsr *Leaser) loopProlong() {
 		return
 	}
 
-	for _, ls0 := range prolong {
-		ls := lsr.getOrCreate(ls0.Resource)
-		ls.lock()
-		if ls.Rev != ls0.Rev {
-			ls.unlock()
-			continue
-		}
-
-		if err := lsr.d.Upsert(ls.Owner, ls.Resource, lsr.dur); err != nil {
-			log.Println("[ERROR] leaser: prolong:", err)
-			ls.cancel()
-		}
-
-		ls.ExpireAt = time.Now().Add(lsr.dur)
-		ls.unlock()
+	for _, resource := range prolong {
+		lsr.prolongResource(resource, left)
 	}
+}
+
+func (lsr *Leaser) prolongResource(resource string, left time.Time) {
+	ls := lsr.getOrCreate(resource)
+	ls.lock()
+	defer ls.unlock()
+
+	if ls.Owner == `` {
+		return
+	}
+	if ls.ExpireAt.Before(left) {
+		return
+	}
+
+	if err := lsr.d.Upsert(ls.Owner, ls.Resource, lsr.dur); errors.Is(err, ErrAlreadyAcquired) {
+		log.Printf("[ERROR] leaser: prolong: %s", err)
+		ls.cancel()
+		ls.Owner = `tbd`
+		return
+	} else if err != nil {
+		ls.prolongAttempts++
+		if ls.prolongAttempts > 3 {
+			log.Printf("[ERROR] leaser: prolong: %s", err)
+			ls.cancel()
+		} else {
+			log.Printf("[WARN] leaser: prolong: %s", err)
+		}
+
+		return
+	}
+
+	ls.prolongAttempts = 0
+	ls.ExpireAt = time.Now().Add(lsr.dur)
 }
 
 func (lsr *Leaser) loopTail() {
@@ -235,22 +268,22 @@ func (lsr *Leaser) loopTail() {
 func (lsr *Leaser) tail() error {
 	limit := int64(1000)
 	for {
-		leases, err := lsr.d.Tail(lsr.leasesSinceRev, limit)
+		tailedLeases, err := lsr.d.Tail(lsr.leasesSinceRev, limit)
 		if err != nil {
 			return fmt.Errorf("tail: %w", err)
 		}
 
-		if len(leases) == 0 {
+		if len(tailedLeases) == 0 {
 			return nil
 		}
 
-		for _, tailLease := range leases {
-			lsr.update(*tailLease)
+		for _, tailedLS := range tailedLeases {
+			lsr.update(tailedLS)
 		}
 
-		lsr.leasesSinceRev = leases[len(leases)-1].Rev
+		lsr.leasesSinceRev = tailedLeases[len(tailedLeases)-1].Rev
 
-		if int64(len(leases)) < limit {
+		if int64(len(tailedLeases)) < limit {
 			return nil
 		}
 	}
