@@ -152,6 +152,7 @@ func (lsr *Leaser) getOrCreate(resource string) *lease {
 	lsr.leasesMux.RUnlock()
 
 	if !ok {
+
 		lsr.leasesMux.Lock()
 		ctx, cancel := context.WithCancel(context.Background())
 		lsr.leases[resource] = &lease{
@@ -238,10 +239,10 @@ func (lsr *Leaser) tail() error {
 		}
 
 		for _, tailLease := range leases {
-
+			lsr.update(*tailLease)
 		}
 
-		lsr.leasesSinceRev = leases[len(leases)-1].rev
+		lsr.leasesSinceRev = leases[len(leases)-1].Rev
 
 		if int64(len(leases)) < limit {
 			return nil
