@@ -33,16 +33,16 @@ func (d *Driver) Head(sinceRev, limit int64) ([]leaser.Lease, error) {
 	q := `
 SELECT resource, rev, owner, expires_at 
 FROM 
-    (
+	(
 		SELECT xmin::text::bigint, resource, rev, owner, expires_at  
 		FROM leases 
 		WHERE rev > $1 
 		ORDER BY "rev" ASC LIMIT $2
 	) AS subquery
 	CROSS JOIN (
-    	SELECT 
-        split_part(pg_current_snapshot()::text, ':', 1)::bigint AS xmin, 
-        split_part(pg_current_snapshot()::text, ':', 2)::bigint AS xmax
+		SELECT 
+		split_part(pg_current_snapshot()::text, ':', 1)::bigint AS xmin, 
+		split_part(pg_current_snapshot()::text, ':', 2)::bigint AS xmax
 	) AS snapshot
 WHERE subquery.xmin < snapshot.xmin OR subquery.xmin > snapshot.xmax
 ;
