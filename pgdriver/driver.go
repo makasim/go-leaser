@@ -83,16 +83,17 @@ func (d *Driver) Upsert(owner, resource string, dur time.Duration) error {
 	qCtx, qCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer qCancel()
 
-	var rev int64
-
-	err := d.db.QueryRow(qCtx, `
+	q := `
 INSERT INTO leases (resource, owner, expires_at, rev)
 VALUES ($1, $2, expires_at = NOW() + INTERVAL '1 second'*$3, nextval('leases_rev_seq'))
 ON CONFLICT (resource) DO
-	UPDATE SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at, rev = EXCLUDED.rev
+	UPDATE SET expires_at = EXCLUDED.expires_at, rev = EXCLUDED.rev
 	WHERE owner = $1 OR expires_at < NOW()
 RETURNING rev
-`, resource, owner, dur).Scan(&rev)
+`
+
+	var rev int64
+	err := d.db.QueryRow(qCtx, q, resource, owner, dur).Scan(&rev)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return leaser.ErrAlreadyAcquired
 	} else if err != nil {
@@ -113,14 +114,15 @@ func (d *Driver) Delete(owner, resource string) error {
 	qCtx, qCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer qCancel()
 
-	var rev int64
-
-	err := d.db.QueryRow(qCtx, `
+	q := `
 UPDATE leases 
 SET owner = '', expires_at = 0, rev = nextval('leases_rev_seq')
 WHERE owner = $1 AND resource = $2
 RETURNING rev
-`, owner, resource).Scan(&rev)
+`
+
+	var rev int64
+	err := d.db.QueryRow(qCtx, q, owner, resource).Scan(&rev)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// It's very bad sign.
 		// It means that lease was already deleted by another owner, which means
