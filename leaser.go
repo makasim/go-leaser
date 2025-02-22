@@ -25,7 +25,7 @@ type Leaser struct {
 	owner string
 
 	leasesMux      *sync.RWMutex
-	leases         map[string]*Lease
+	leases         map[string]*lease
 	leasesSinceRev int64
 
 	wg      *sync.WaitGroup
@@ -40,7 +40,7 @@ func New(d driver) (*Leaser, error) {
 		owner: genOwner(),
 
 		leasesMux: &sync.RWMutex{},
-		leases:    make(map[string]*Lease),
+		leases:    make(map[string]*lease),
 
 		wg:      &sync.WaitGroup{},
 		closeCh: make(chan struct{}),
@@ -65,88 +65,76 @@ func New(d driver) (*Leaser, error) {
 	return lsr, nil
 }
 
-func (lsr *Leaser) Acquire(resource string) (*Lease, error) {
+func (lsr *Leaser) Acquire(resource string) (Lease, error) {
 	select {
 	case <-lsr.closeCh:
-		return nil, fmt.Errorf(`leaser is closed`)
+		return Lease{}, fmt.Errorf(`leaser is closed`)
 	default:
 	}
 
 	if resource == `` {
-		return nil, fmt.Errorf(`resource must be provided`)
+		return Lease{}, fmt.Errorf(`resource must be provided`)
 	}
 
-	lsr.leasesMux.RLock()
-	if ls, ok := lsr.leases[resource]; ok && ls.owner != `` {
-		lsr.leasesMux.RUnlock()
-		return nil, ErrAlreadyAcquired
-	}
-	lsr.leasesMux.RUnlock()
+	ls := lsr.getOrCreate(resource)
 
-	lsr.leasesMux.Lock()
-	defer lsr.leasesMux.Unlock()
+	ls.lock()
+	defer ls.unlock()
 
-	if ls, ok := lsr.leases[resource]; ok && ls.owner != `` {
-		return nil, ErrAlreadyAcquired
-	}
-
-	if err := lsr.d.Upsert(lsr.owner, resource, lsr.dur); errors.Is(err, ErrAlreadyAcquired) {
-		// we know that the resource has been acquired by someone else, but we have not yet tailed it.
-		lsr.leases[resource] = &Lease{
-			owner:    "tbd",
-			resource: resource,
+	for {
+		if ls.Owner != `` {
+			ls.wait()
+			continue
 		}
-		return nil, err
-	} else if err != nil {
-		return nil, err
-	}
 
-	baseCtx, baseCtxCancel := context.WithCancel(context.Background())
-	ls := &Lease{
-		owner:      lsr.owner,
-		resource:   resource,
-		expireAt:   time.Now().Add(lsr.dur),
-		canceledCh: baseCtx.Done(),
-		cancel:     baseCtxCancel,
-	}
-	lsr.leases[resource] = ls
+		if err := lsr.d.Upsert(lsr.owner, resource, lsr.dur); errors.Is(err, ErrAlreadyAcquired) {
+			// we know that the resource has been acquired by someone else, but we have not yet tailed it.
+			ls.Owner = `tbd`
+			continue
+		} else if err != nil {
+			return Lease{}, err
+		}
 
-	return ls, nil
+		ls.Owner = lsr.owner
+		ls.ExpireAt = time.Now().Add(lsr.dur)
+		return ls.Lease, nil
+	}
 }
 
-func (lsr *Leaser) Release(ls *Lease) error {
-	if ls.resource == `` {
+func (lsr *Leaser) Release(ls0 Lease) error {
+	if ls0.Resource == `` {
 		return fmt.Errorf(`lease must be acquired; resource empty`)
 	}
-	if ls.owner == `` {
+	if ls0.Owner == `` {
 		return fmt.Errorf(`lease must be acquired; owner empty`)
 	}
 
-	lsr.leasesMux.RLock()
-	if storedLS, ok := lsr.leases[ls.resource]; !ok {
-		lsr.leasesMux.RUnlock()
+	ls := lsr.getOrCreate(ls0.Resource)
+
+	ls.lock()
+	defer ls.unlock()
+
+	if ls.Owner == `` {
 		return ErrNotAcquired
-	} else if storedLS.owner != ls.owner {
-		lsr.leasesMux.RUnlock()
-		return ErrAlreadyAcquired
-	}
-	lsr.leasesMux.RUnlock()
-
-	lsr.leasesMux.Lock()
-	defer lsr.leasesMux.Unlock()
-
-	if storedLS, ok := lsr.leases[ls.resource]; ok && ls.owner != storedLS.owner {
+	} else if ls.Owner != ls0.Owner {
 		return ErrAlreadyAcquired
 	}
 
-	if err := lsr.d.Delete(ls.owner, ls.resource); errors.Is(err, ErrNotAcquired) {
-		delete(lsr.leases, ls.resource)
+	if err := lsr.d.Delete(ls.Owner, ls.Resource); errors.Is(err, ErrNotAcquired) {
+		ls.Owner = ``
+		ls.Rev = 0
+		ls.ExpireAt = time.Time{}
+		ls.cond.Signal()
+
 		return err
 	} else if err != nil {
 		return fmt.Errorf("%T: %w", lsr.d, err)
 	}
 
-	delete(lsr.leases, ls.resource)
+	ls.Owner = ``
+	ls.Rev = 0
+	ls.ExpireAt = time.Time{}
+	ls.cond.Signal()
 
 	return nil
 }
@@ -158,19 +146,44 @@ func (lsr *Leaser) Close() error {
 	return nil
 }
 
+func (lsr *Leaser) getOrCreate(resource string) *lease {
+	lsr.leasesMux.RLock()
+	ls, ok := lsr.leases[resource]
+	lsr.leasesMux.RUnlock()
+
+	if !ok {
+		lsr.leasesMux.Lock()
+		ctx, cancel := context.WithCancel(context.Background())
+		lsr.leases[resource] = &lease{
+			Lease: Lease{
+				Owner:    ``,
+				Resource: resource,
+				ctx:      ctx,
+			},
+			cancel: cancel,
+			cond:   sync.NewCond(&sync.Mutex{}),
+		}
+		lsr.leasesMux.Unlock()
+	}
+
+	return ls
+}
+
 func (lsr *Leaser) loopProlong() {
 
-	defer lsr.leasesMux.Unlock()
-
 	lsr.leasesMux.RLock()
-	prolong := make([]*Lease, 0, len(lsr.leases))
+
+	prolong := make([]Lease, 0, len(lsr.leases))
 	left := time.Now().Add(-time.Second * 20)
 	for _, ls := range lsr.leases {
-		if ls.expireAt.Before(left) {
+		if ls.Owner == `` {
+			continue
+		}
+		if ls.ExpireAt.Before(left) {
 			continue
 		}
 
-		prolong = append(prolong, ls)
+		prolong = append(prolong, ls.Lease)
 	}
 	lsr.leasesMux.RUnlock()
 
@@ -178,21 +191,21 @@ func (lsr *Leaser) loopProlong() {
 		return
 	}
 
-	lsr.leasesMux.Lock()
-	defer lsr.leasesMux.Unlock()
-
-	for _, ls := range prolong {
-		if lsr.leases[ls.resource].rev != ls.rev {
+	for _, ls0 := range prolong {
+		ls := lsr.getOrCreate(ls0.Resource)
+		ls.lock()
+		if ls.Rev != ls0.Rev {
+			ls.unlock()
 			continue
 		}
 
-		if err := lsr.d.Upsert(ls.owner, ls.resource, lsr.dur); err != nil {
+		if err := lsr.d.Upsert(ls.Owner, ls.Resource, lsr.dur); err != nil {
 			log.Println("[ERROR] leaser: prolong:", err)
 			ls.cancel()
 		}
 
-		ls.expireAt = time.Now().Add(lsr.dur)
-		lsr.leases[ls.resource] = ls
+		ls.ExpireAt = time.Now().Add(lsr.dur)
+		ls.unlock()
 	}
 }
 
@@ -224,14 +237,9 @@ func (lsr *Leaser) tail() error {
 			return nil
 		}
 
-		lsr.leasesMux.Lock()
-		for _, lease := range leases {
-			currLease := lsr.leases[lease.resource]
-			if currLease.rev < lease.rev {
-				lsr.leases[lease.resource] = lease
-			}
+		for _, tailLease := range leases {
+
 		}
-		lsr.leasesMux.Unlock()
 
 		lsr.leasesSinceRev = leases[len(leases)-1].rev
 
@@ -239,6 +247,30 @@ func (lsr *Leaser) tail() error {
 			return nil
 		}
 	}
+}
+
+func (lsr *Leaser) update(tailedLS Lease) {
+	ls := lsr.getOrCreate(tailedLS.Resource)
+	ls.lock()
+	defer ls.unlock()
+
+	if ls.Rev >= tailedLS.Rev {
+		return
+	}
+
+	if ls.Owner == lsr.owner {
+		ls.Lease.Rev = tailedLS.Rev
+		ls.Lease.ExpireAt = time.Now().Add(lsr.dur)
+	} else {
+		ls.cancel()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ls.Lease = tailedLS
+		ls.Lease.ctx = ctx
+		ls.cancel = cancel
+	}
+
+	ls.cond.Signal()
 }
 
 func genOwner() string {

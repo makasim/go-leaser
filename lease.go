@@ -2,23 +2,38 @@ package leaser
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
 type Lease struct {
-	owner    string
-	resource string
+	Owner    string
+	Resource string
+	Rev      int64
+	ExpireAt time.Time
 
-	rev        int64
-	expireAt   time.Time
-	canceledCh chan struct{}
-	cancel     context.CancelFunc
+	ctx context.Context
 }
 
-func (l *Lease) Resource() string {
-	return l.resource
+func (l *Lease) Done() <-chan struct{} {
+	return l.ctx.Done()
 }
 
-func (l *Lease) Owner() string {
-	return l.owner
+type lease struct {
+	Lease
+
+	cancel context.CancelFunc
+	cond   *sync.Cond
+}
+
+func (l *lease) lock() {
+	l.cond.L.Lock()
+}
+
+func (l *lease) unlock() {
+	l.cond.L.Unlock()
+}
+
+func (l *lease) wait() {
+	l.cond.Wait()
 }
