@@ -70,18 +70,18 @@ func (lsr *Leaser) Acquire(resource string) (Lease, error) {
 		return Lease{}, fmt.Errorf(`resource must be provided`)
 	}
 
-	select {
-	case <-lsr.closeCh:
-		return Lease{}, fmt.Errorf(`leaser is closed`)
-	default:
-	}
-
 	ls := lsr.getOrCreate(resource)
 
 	ls.lock()
 	defer ls.unlock()
 
 	for {
+		select {
+		case <-lsr.closeCh:
+			return Lease{}, fmt.Errorf(`leaser is closed`)
+		default:
+		}
+
 		if ls.Owner != `` {
 			ls.wait()
 			continue
@@ -142,7 +142,17 @@ func (lsr *Leaser) Release(ls0 Lease) error {
 }
 
 func (lsr *Leaser) Close() error {
+	lsr.leasesMux.Lock()
+	defer lsr.leasesMux.Unlock()
+
 	close(lsr.closeCh)
+	for _, ls := range lsr.leases {
+		ls.cond.Broadcast()
+		ls.cancel()
+
+		// todo: release?
+	}
+
 	lsr.wg.Wait()
 
 	return nil
